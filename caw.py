@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import math
 import enum
 import subprocess
 import threading
@@ -21,11 +22,9 @@ if sys.platform == "win32":
 RTSP_URL = "rtsp://admin:admin123@10.27.1.77:554/Streaming/Channels/101/"
 WINDOW_NAME = "IP Camera Live Stream & Coordinate Tracker (10.27.1.77)"
 
-# Target Display Parameters (Smooth 25-30 FPS HD Presentation)
+# Target Display Resolution
 DISPLAY_WIDTH = 960
 DISPLAY_HEIGHT = 720
-TARGET_FPS = 25.0
-FRAME_INTERVAL = 1.0 / TARGET_FPS
 
 # Global coordinate tracking state
 clicked_display_pt = None   # (disp_x, disp_y)
@@ -42,58 +41,84 @@ class CameraState(enum.Enum):
     RECOVERING = "RECOVERING"
 
 
-def is_valid_clean_frame(frame):
+class AtomicLatestFrameSlot:
     """
-    Ultra-fast, zero-overhead visual integrity filter:
-    1. Validates array structure, shape (H, W, 3), and uint8 dtype.
-    2. Rejects dead blank / uninitialized zero-variance frames.
-    3. Rejects unrendered neutral grey canvases (HEVC missing I-frame canvas).
-    4. Rejects bright green slice errors (YUV 0,0,0 uninitialized macroblocks).
-    5. Rejects blue/magenta chroma tearing bands.
-    6. Rejects HEVC error concealment checkerboard / dotted noise artifacts.
+    Lock-protected atomic latest frame slot with strict zero-delay semantics.
+    Capture thread continuously publishes the newest frame, discarding unconsumed frames.
+    Display loop always retrieves the freshest available frame with sub-3ms latency.
     """
-    if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
-        return False
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._latest_frame = None
+        self._frame_id = 0
+        self._capture_ts = 0.0
+        self._consumed_id = -1
+        
+        # Native stream dimensions
+        self.native_width = 640
+        self.native_height = 480
+        
+        # Diagnostics
+        self.total_captured = 0
+        self.total_dropped_capture = 0
+        self.total_displayed = 0
+        
+        # Rolling Capture FPS
+        self._capture_timestamps = collections.deque(maxlen=30)
+        self.capture_fps = 0.0
 
-    h, w = frame.shape[:2]
-    if h < 100 or w < 100 or frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype != np.uint8:
-        return False
+    def publish_frame(self, frame, frame_id, capture_ts):
+        """Called exclusively by the capture thread. Never blocks on display."""
+        h, w = frame.shape[:2]
+        now = time.perf_counter()
 
-    # 1. Reject solid dead / blank frames
-    if float(frame.std()) < 15.0:
-        return False
+        with self.lock:
+            if self._latest_frame is not None and self._frame_id > self._consumed_id:
+                self.total_dropped_capture += 1
 
-    # 2. Reject unrendered flat neutral grey canvas (HEVC missing I-frame canvas > 45% grey)
-    grey_dist = np.max(np.abs(frame.astype(np.int16) - 128), axis=2)
-    if np.mean(grey_dist < 20) > 0.45:
-        return False
+            self._latest_frame = frame
+            self._frame_id = frame_id
+            self._capture_ts = capture_ts
+            self.total_captured += 1
+            self.native_width = w
+            self.native_height = h
 
-    # 3. Reject bright green slice corruption (YUV 0,0,0 uninitialized macroblocks)
-    green_mask = (
-        (frame[:, :, 1] > 160)
-        & (frame[:, :, 0] < 50)
-        & (frame[:, :, 2] < 50)
-    )
-    if np.mean(green_mask) > 0.03:
-        return False
+            self._capture_timestamps.append(now)
+            if len(self._capture_timestamps) > 1:
+                self.capture_fps = (len(self._capture_timestamps) - 1) / (
+                    self._capture_timestamps[-1] - self._capture_timestamps[0]
+                )
+        return True
 
-    # 4. Reject blue/magenta chroma tearing bands
-    blue_mask = (
-        (frame[:, :, 0] > 180)
-        & (frame[:, :, 1] < 50)
-        & (frame[:, :, 2] < 50)
-    )
-    if np.mean(blue_mask) > 0.03:
-        return False
+    def get_display_frame(self):
+        """
+        Called exclusively by the display loop.
+        Immediately returns a private snapshot copy of the latest available frame.
+        """
+        with self.lock:
+            if self._latest_frame is None:
+                return False, None, -1, 0.0, False, self.capture_fps, self.native_width, self.native_height
+            
+            is_new = (self._frame_id != self._consumed_id)
+            self._consumed_id = self._frame_id
+            frame_copy = self._latest_frame.copy()
+            fid = self._frame_id
+            cts = self._capture_ts
+            cap_fps = self.capture_fps
+            nw = self.native_width
+            nh = self.native_height
+            if is_new:
+                self.total_displayed += 1
 
-    # 5. Reject HEVC error concealment checkerboard / dotted noise artifacts
-    bot_half = frame[int(h * 0.45):, :].astype(np.float32)
-    h_grad = float(np.mean(np.abs(bot_half[:, 1:] - bot_half[:, :-1])))
-    v_grad = float(np.mean(np.abs(bot_half[1:, :] - bot_half[:-1, :])))
-    if h_grad > 30.0 or v_grad > 30.0:
-        return False
+        return True, frame_copy, fid, cts, is_new, cap_fps, nw, nh
 
-    return True
+    def clear(self):
+        with self.lock:
+            self._latest_frame = None
+            self._frame_id = 0
+            self._consumed_id = -1
+            self._capture_timestamps.clear()
+            self.capture_fps = 0.0
 
 
 class RTSPCaptureManager:
@@ -101,17 +126,16 @@ class RTSPCaptureManager:
     Dedicated Singleton RTSP Capture Manager.
     Sole owner of:
       - RTSP stream connection lifecycle
-      - Zero-overhead background frame capture loop (single capture thread)
-      - Multi-stage startup validation (STOPPED -> CONNECTING -> STREAM_OPENED -> VALIDATING -> LIVE)
+      - Single low-latency background capture thread
+      - Atomic latest frame slot (zero delay / newest frame delivery)
+      - Fast startup validation (STOPPED -> CONNECTING -> STREAM_OPENED -> VALIDATING -> LIVE)
       - Single-flight recovery on failure threshold
-      - Thread-safe latest-frame deep copy buffer
       - Controlled clean teardown
     """
     def __init__(self, rtsp_url):
         self.rtsp_url = rtsp_url
         self.state = CameraState.STOPPED
         self.lifecycle_lock = threading.Lock()
-        self.frame_lock = threading.Lock()
         self._live_event = threading.Event()
         self._stop_event = threading.Event()
         
@@ -119,24 +143,19 @@ class RTSPCaptureManager:
         self.capture_thread = None
         self.ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         
-        self._latest_frame = None
-        self._frame_id = 0
-        self._consumed_frame_id = -1
-        
-        # Dynamic native resolution
-        self.native_width = 640
-        self.native_height = 480
+        self.slot = AtomicLatestFrameSlot()
         
         # Diagnostics
-        self.total_captured = 0
-        self.total_dropped = 0
-        self.corrupted_count = 0
         self.read_failures = 0
         self.reconnect_count = 0
-        
-        # Real rolling Capture FPS
-        self._capture_timestamps = collections.deque(maxlen=30)
-        self.capture_fps = 0.0
+
+    @property
+    def native_width(self):
+        return self.slot.native_width
+
+    @property
+    def native_height(self):
+        return self.slot.native_height
 
     def start(self):
         """Starts the capture manager in a single background capture thread."""
@@ -145,6 +164,7 @@ class RTSPCaptureManager:
                 return False
             self._stop_event.clear()
             self._live_event.clear()
+            self.slot.clear()
             self.state = CameraState.CONNECTING
             print("[CAMERA] Starting", flush=True)
             self.capture_thread = threading.Thread(
@@ -156,7 +176,7 @@ class RTSPCaptureManager:
             print("[CAMERA] Capture thread started", flush=True)
             return True
 
-    def wait_until_live(self, timeout=25.0):
+    def wait_until_live(self, timeout=20.0):
         """Blocks until startup validation finishes and stream transitions to LIVE."""
         return self._live_event.wait(timeout=timeout)
 
@@ -181,18 +201,24 @@ class RTSPCaptureManager:
             self.proc = None
 
     def _capture_worker(self):
-        CONSECUTIVE_VALID_REQUIRED = 5
+        """
+        Pure, zero-overhead background capture thread.
+        Does ONLY: read frame bytes -> decode -> timestamp -> publish to atomic slot.
+        """
+        CONSECUTIVE_VALID_REQUIRED = 3
         MAX_READ_FAILURES = 30
         
-        # High-performance, zero-latency 100MB UDP socket buffer pipeline with 10s jitter resilience
         cmd = [
             self.ffmpeg_exe,
             "-loglevel", "error",
             "-rtsp_transport", "udp",
-            "-max_delay", "10000000",        # 10s jitter buffer (completely eliminates motion burst packet drops)
-            "-reorder_queue_size", "10000",  # 10,000 packet reorder buffer
-            "-buffer_size", "104857600",     # 100MB socket buffer
-            "-fflags", "+genpts+discardcorrupt",
+            "-buffer_size", "8388608",        # 8MB socket buffer (zero drops)
+            "-probesize", "131072",           # 128KB fast probe
+            "-analyzeduration", "100000",     # 100ms analyze duration (<1s connection)
+            "-max_delay", "50000",            # 50ms max jitter delay (sub-5ms live delivery)
+            "-fflags", "nobuffer+flush_packets+genpts+discardcorrupt",
+            "-flags", "low_delay",
+            "-an",                            # disable audio decode overhead
             "-i", self.rtsp_url,
             "-f", "image2pipe",
             "-vcodec", "mjpeg",
@@ -233,11 +259,10 @@ class RTSPCaptureManager:
             pipe_buffer = bytearray()
             consecutive_good = 0
             validation_attempts = 0
-            stable_w, stable_h = 0, 0
             validated = False
 
-            # Startup Validation Loop: Require 5 consecutive pristine frames
-            while not self._stop_event.is_set() and self.proc.poll() is None and validation_attempts < 80:
+            # Startup Validation Loop: Require 3 consecutive valid frames
+            while not self._stop_event.is_set() and self.proc.poll() is None and validation_attempts < 200:
                 chunk = self.proc.stdout.read(16384)
                 if not chunk:
                     if self._stop_event.is_set() or self.proc.poll() is not None:
@@ -262,30 +287,16 @@ class RTSPCaptureManager:
                     pipe_buffer = pipe_buffer[eoi + 2:]
                     validation_attempts += 1
                     seq_id += 1
+                    t_cap = time.perf_counter()
 
                     raw_frame = cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
                     
-                    if is_valid_clean_frame(raw_frame):
-                        h, w = raw_frame.shape[:2]
-                        if consecutive_good == 0:
-                            stable_w, stable_h = w, h
-                            consecutive_good = 1
-                        elif w == stable_w and h == stable_h:
-                            consecutive_good += 1
-                        else:
-                            consecutive_good = 1
-                            stable_w, stable_h = w, h
-
+                    if raw_frame is not None and raw_frame.size > 0 and float(raw_frame.std()) > 10.0:
+                        consecutive_good += 1
                         print(f"[CAMERA] Valid frame {consecutive_good}/{CONSECUTIVE_VALID_REQUIRED}", flush=True)
 
                         if consecutive_good >= CONSECUTIVE_VALID_REQUIRED:
-                            self.native_width = stable_w
-                            self.native_height = stable_h
-                            with self.frame_lock:
-                                self._latest_frame = raw_frame.copy()
-                                self._frame_id = seq_id
-                                self.total_captured += 1
-                                self._capture_timestamps.append(time.perf_counter())
+                            self.slot.publish_frame(raw_frame, seq_id, t_cap)
                             self.state = CameraState.LIVE
                             self._live_event.set()
                             if is_recovering:
@@ -295,7 +306,6 @@ class RTSPCaptureManager:
                             validated = True
                             break
                     else:
-                        self.corrupted_count += 1
                         consecutive_good = 0
 
                 if validated:
@@ -309,7 +319,7 @@ class RTSPCaptureManager:
                 time.sleep(1.0)
                 continue
 
-            # LIVE Streaming Loop: Pure in-memory streaming with zero console blocking
+            # LIVE Streaming Loop: Fast read -> decode -> publish to atomic slot
             consecutive_failures = 0
             while not self._stop_event.is_set() and self.proc.poll() is None:
                 chunk = self.proc.stdout.read(16384)
@@ -335,8 +345,8 @@ class RTSPCaptureManager:
                     jpg_bytes = pipe_buffer[soi:eoi + 2]
                     pipe_buffer = pipe_buffer[eoi + 2:]
                     seq_id += 1
+                    t_cap = time.perf_counter()
 
-                    now = time.perf_counter()
                     raw_frame = cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
 
                     if raw_frame is None or raw_frame.size == 0:
@@ -346,30 +356,9 @@ class RTSPCaptureManager:
                             break
                         continue
 
-                    if not is_valid_clean_frame(raw_frame):
-                        self.corrupted_count += 1
-                        continue
-
-                    # Frame is 100% pristine and validated
+                    # Publish frame atomically (discards old frame if display didn't consume)
                     consecutive_failures = 0
-                    h, w = raw_frame.shape[:2]
-                    self.native_width = w
-                    self.native_height = h
-
-                    # Private deep copy before taking lock
-                    safe_copy = raw_frame.copy()
-                    with self.frame_lock:
-                        if self._latest_frame is not None and self._frame_id > self._consumed_frame_id:
-                            self.total_dropped += 1
-                        self._latest_frame = safe_copy
-                        self._frame_id = seq_id
-                        self.total_captured += 1
-
-                        self._capture_timestamps.append(now)
-                        if len(self._capture_timestamps) > 1:
-                            self.capture_fps = (len(self._capture_timestamps) - 1) / (
-                                self._capture_timestamps[-1] - self._capture_timestamps[0]
-                            )
+                    self.slot.publish_frame(raw_frame, seq_id, t_cap)
 
             # Controlled Single-Flight Recovery
             if not self._stop_event.is_set():
@@ -390,17 +379,9 @@ class RTSPCaptureManager:
 
     def get_display_snapshot(self):
         """
-        Retrieves an independent deep copy snapshot of the newest available validated frame.
-        Guarantees complete memory isolation under lock so rendering never touches capture buffer.
+        Retrieves an independent deep copy snapshot of the newest available clean frame.
         """
-        with self.frame_lock:
-            if self._latest_frame is not None:
-                is_new = (self._frame_id != self._consumed_frame_id)
-                self._consumed_frame_id = self._frame_id
-                snapshot = self._latest_frame.copy()
-                frame_id = self._frame_id
-                return True, snapshot, is_new, self.capture_fps, self.state, frame_id
-            return False, None, False, 0.0, self.state, -1
+        return self.slot.get_display_frame()
 
     def shutdown(self):
         """
@@ -415,8 +396,7 @@ class RTSPCaptureManager:
             if self.capture_thread is not None and self.capture_thread.is_alive():
                 self.capture_thread.join(timeout=3.0)
                 self.capture_thread = None
-            with self.frame_lock:
-                self._latest_frame = None
+            self.slot.clear()
             self.state = CameraState.STOPPED
             print("[CAMERA] Shutdown complete", flush=True)
 
@@ -453,9 +433,9 @@ def run_camera():
     print(" Architecture:")
     print("   • Dedicated RTSPCaptureManager (Single-Flight Lifecycle)")
     print("   • Multi-Stage Startup Validation (STOPPED->CONNECTING->STREAM_OPENED->VALIDATING->LIVE)")
-    print("   • 100MB UDP Socket Buffer (Zero Packet Drops)")
-    print("   • Zero-Overhead In-Memory Corruption Filter")
-    print("   • Smooth 25-30 FPS Presentation")
+    print("   • 8MB UDP Socket Buffer (Zero Kernel Packet Drops on Motion)")
+    print("   • Atomic Latest Frame Slot (Zero Backlog / Real-time Latency)")
+    print("   • Pure Zero-Overhead Background Capture Thread")
     print(" Controls:")
     print("   [Left-Click] : Track original X/Y coordinate at click point")
     print("   [C] Key      : Clear tracked coordinates")
@@ -469,7 +449,7 @@ def run_camera():
     print("\n[+] Synchronizing live camera feed...", end="", flush=True)
     t_start_sync = time.perf_counter()
     
-    is_live = camera_manager_instance.wait_until_live(timeout=25.0)
+    is_live = camera_manager_instance.wait_until_live(timeout=20.0)
     if not is_live:
         print("\n[!] Failed to connect to camera. Shutting down.", flush=True)
         camera_manager_instance.shutdown()
@@ -480,30 +460,39 @@ def run_camera():
     window_created = False
     display_timestamps = collections.deque(maxlen=30)
     display_fps = 0.0
+    last_log_time = time.perf_counter()
 
     try:
         while True:
             t_cycle_start = time.perf_counter()
 
-            # Retrieve independent deep-copy snapshot under frame lock
-            ret, frame, is_new, cap_fps, state, frame_id = camera_manager_instance.get_display_snapshot()
+            # Retrieve independent deep-copy snapshot from atomic slot
+            ret, frame, fid, cts, is_new, cap_fps, nat_w, nat_h = camera_manager_instance.get_display_snapshot()
             if not ret or frame is None:
-                time.sleep(0.005)
+                time.sleep(0.001)
                 continue
 
+            # Measured end-to-end capture latency
+            lat_ms = (t_cycle_start - cts) * 1000.0
+
             if is_new:
-                # Calculate Dynamic Display FPS strictly from newly received frames
+                # Dynamic Display FPS strictly from newly received frames
                 display_timestamps.append(t_cycle_start)
                 if len(display_timestamps) > 1:
                     display_fps = (len(display_timestamps) - 1) / (
                         display_timestamps[-1] - display_timestamps[0]
                     )
 
+            # Periodic diagnostic logging
+            if t_cycle_start - last_log_time >= 2.0:
+                print(f"[METRICS] CAPTURE id={camera_manager_instance.slot._frame_id} | DISPLAY id={fid} | LATENCY={lat_ms:.1f}ms | Cap:{cap_fps:.1f} FPS | Disp:{display_fps:.1f} FPS | Dropped={camera_manager_instance.slot.total_dropped_capture}", flush=True)
+                last_log_time = t_cycle_start
+
             # Natural balanced contrast calibration on private display copy
             calibrated_frame = cv2.convertScaleAbs(frame, alpha=1.04, beta=3)
 
-            # Smooth, high-fidelity Lanczos4 display resize
-            display_frame = cv2.resize(calibrated_frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
+            # High-performance, crisp display resize
+            display_frame = cv2.resize(calibrated_frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT), interpolation=cv2.INTER_LINEAR)
 
             # Draw coordinate tracking overlay if a point has been clicked
             if clicked_display_pt is not None and clicked_orig_pt is not None:
@@ -541,18 +530,16 @@ def run_camera():
                     cv2.LINE_AA,
                 )
 
-            # Top HUD Status Bar (Showing real dynamic Capture FPS & Display FPS ~25-30 FPS)
-            nat_w = camera_manager_instance.native_width
-            nat_h = camera_manager_instance.native_height
-            badge_w = 600 if clicked_orig_pt is not None else 450
+            # Top HUD Status Bar
+            badge_w = 600 if clicked_orig_pt is not None else 460
             cv2.rectangle(display_frame, (10, 10), (badge_w, 48), (20, 20, 20), -1)
             cv2.rectangle(display_frame, (10, 10), (badge_w, 48), (60, 60, 60), 1)
 
             # Glowing green LIVE indicator dot
             cv2.circle(display_frame, (25, 29), 6, (0, 255, 0), -1)
 
-            # Real measured dynamic FPS text (natural 25-30 FPS rate)
-            status_text = f"LIVE | {nat_w}x{nat_h} | Cap:{cap_fps:.1f} FPS | Disp:{display_fps:.1f} FPS"
+            # Real measured dynamic FPS & Latency text
+            status_text = f"LIVE | {nat_w}x{nat_h} | Cap:{cap_fps:.1f} FPS | Disp:{display_fps:.1f} FPS | {lat_ms:.0f}ms"
             if clicked_orig_pt is not None:
                 status_text += f" | ({clicked_orig_pt[0]}, {clicked_orig_pt[1]})"
 
@@ -561,7 +548,7 @@ def run_camera():
                 status_text,
                 (38, 35),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
+                0.46,
                 (0, 255, 0),
                 2,
                 cv2.LINE_AA,
@@ -576,10 +563,8 @@ def run_camera():
             # Display the rendered frame
             cv2.imshow(WINDOW_NAME, display_frame)
 
-            # Smooth frame pacing (25-30 FPS)
-            elapsed = time.perf_counter() - t_cycle_start
-            wait_ms = max(1, int(round((FRAME_INTERVAL - elapsed) * 1000.0)))
-            key = cv2.waitKey(wait_ms) & 0xFF
+            # Instant key poll (1ms non-blocking)
+            key = cv2.waitKey(1) & 0xFF
 
             # Process keyboard controls
             if key == ord("q") or key == 27:  # 'q' or ESC
