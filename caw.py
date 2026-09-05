@@ -121,16 +121,42 @@ class AtomicLatestFrameSlot:
             self.capture_fps = 0.0
 
 
+def is_clean_frame(frame):
+    """
+    Validates that a frame is genuine, full-contrast, and free from
+    H.265/HEVC macroblock packet loss corruption (grey smear / checkerboard grid).
+    """
+    if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+        return False
+    h, w = frame.shape[:2]
+    if h <= 0 or w <= 0 or frame.ndim != 3 or frame.shape[2] != 3:
+        return False
+    # Overall image contrast / standard deviation
+    if frame.std() < 18.0:
+        return False
+    # Check bottom half for grey smear or default H.265 deblocking block patterns (RGB all ~128)
+    bottom = frame[int(h * 0.4):, :]
+    grey_mask = (
+        (np.abs(bottom[:, :, 0].astype(np.int16) - 128) < 14) &
+        (np.abs(bottom[:, :, 1].astype(np.int16) - 128) < 14) &
+        (np.abs(bottom[:, :, 2].astype(np.int16) - 128) < 14)
+    )
+    if np.mean(grey_mask) > 0.25:
+        return False
+    return True
+
+
 class RTSPCaptureManager:
     """
-    Dedicated Singleton RTSP Capture Manager.
-    Sole owner of:
-      - RTSP stream connection lifecycle
-      - Single low-latency background capture thread
-      - Atomic latest frame slot (zero delay / newest frame delivery)
-      - Fast startup validation (STOPPED -> CONNECTING -> STREAM_OPENED -> VALIDATING -> LIVE)
-      - Single-flight recovery on failure threshold
-      - Controlled clean teardown
+    Dedicated RTSP Capture Manager.
+    Architecture:
+      - Direct FFmpeg decoding to rawvideo (pix_fmt: bgr24) via stdout
+      - Clean Frame Guard (discards any partial grey smear / checkerboard macroblock frames)
+      - Exact fixed-size frame reader (frame_size = width * height * 3)
+      - Atomic latest frame slot (zero backlog / lowest latency)
+      - Dynamic stream resolution probing via FFmpeg
+      - 10 complete raw frames startup validation
+      - Fast single-flight recovery on stream failure or consecutive corrupt frames
     """
     def __init__(self, rtsp_url):
         self.rtsp_url = rtsp_url
@@ -145,17 +171,64 @@ class RTSPCaptureManager:
         
         self.slot = AtomicLatestFrameSlot()
         
+        # Stream dimensions
+        self.width = None
+        self.height = None
+        self.frame_size = None
+        
         # Diagnostics
         self.read_failures = 0
+        self.corrupted_frames = 0
         self.reconnect_count = 0
 
     @property
     def native_width(self):
-        return self.slot.native_width
+        return self.slot.native_width if self.width is None else self.width
 
     @property
     def native_height(self):
-        return self.slot.native_height
+        return self.slot.native_height if self.height is None else self.height
+
+    def probe_resolution(self, timeout=5.0):
+        """
+        Probes the RTSP stream using FFmpeg to dynamically determine
+        the actual native video width and height before starting rawvideo capture.
+        """
+        import re
+        cmd = [
+            self.ffmpeg_exe,
+            "-loglevel", "info",
+            "-probesize", "131072",
+            "-analyzeduration", "100000",
+            "-buffer_size", "8388608",
+            "-an",
+            "-i", self.rtsp_url,
+            "-t", "0.01",
+            "-f", "null",
+            "-"
+        ]
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            t_start = time.time()
+            while time.time() - t_start < timeout:
+                line = p.stderr.readline()
+                if not line:
+                    if p.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                    continue
+                # Match patterns like: Stream #0:0: Video: hevc (Main), yuvj420p(pc, bt709), 640x480
+                m = re.search(r'Stream #\d+:\d+.*Video:.*,\s*(\d{2,5})x(\d{2,5})', line)
+                if m:
+                    w, h = int(m.group(1)), int(m.group(2))
+                    p.kill()
+                    p.wait(timeout=1.0)
+                    return w, h
+            p.kill()
+            p.wait(timeout=1.0)
+        except Exception as e:
+            print(f"[CAMERA] Resolution probe warning: {e}", flush=True)
+        return 640, 480  # Default fallback if probe doesn't report
 
     def start(self):
         """Starts the capture manager in a single background capture thread."""
@@ -176,7 +249,7 @@ class RTSPCaptureManager:
             print("[CAMERA] Capture thread started", flush=True)
             return True
 
-    def wait_until_live(self, timeout=20.0):
+    def wait_until_live(self, timeout=25.0):
         """Blocks until startup validation finishes and stream transitions to LIVE."""
         return self._live_event.wait(timeout=timeout)
 
@@ -190,8 +263,13 @@ class RTSPCaptureManager:
             pass
 
     def _safe_close_proc(self):
-        """Safely terminates and kills stream process."""
+        """Safely terminates and kills stream process and closes stdout."""
         if self.proc is not None:
+            try:
+                if self.proc.stdout:
+                    self.proc.stdout.close()
+            except Exception:
+                pass
             try:
                 self.proc.terminate()
                 self.proc.kill()
@@ -200,29 +278,62 @@ class RTSPCaptureManager:
                 pass
             self.proc = None
 
+    def _read_exactly(self, num_bytes):
+        """
+        Reads EXACTLY num_bytes from FFmpeg stdout.
+        Never combines bytes from different frames.
+        Returns bytes of length num_bytes, or None if EOF or stop requested.
+        """
+        if self.proc is None or self.proc.stdout is None:
+            return None
+        
+        buf = bytearray(num_bytes)
+        pos = 0
+        stream = self.proc.stdout
+        
+        while pos < num_bytes:
+            if self._stop_event.is_set():
+                return None
+            try:
+                chunk = stream.read(num_bytes - pos)
+                if not chunk:
+                    # EOF reached before complete frame
+                    return None
+                buf[pos:pos+len(chunk)] = chunk
+                pos += len(chunk)
+            except Exception:
+                return None
+
+        return bytes(buf)
+
     def _capture_worker(self):
         """
-        Pure, zero-overhead background capture thread.
-        Does ONLY: read frame bytes -> decode -> timestamp -> publish to atomic slot.
+        Pure background capture thread.
+        Pipeline:
+          FFmpeg decode -> rawvideo BGR24 -> stdout
+          -> read_exactly(frame_size) -> is_clean_frame() -> publish to atomic slot.
         """
-        CONSECUTIVE_VALID_REQUIRED = 3
-        MAX_READ_FAILURES = 30
-        
+        CONSECUTIVE_VALID_REQUIRED = 5
+        MAX_CONSECUTIVE_CORRUPT = 25
+        MAX_READ_FAILURES = 15
+
+        # 1. Dynamically probe resolution before starting capture
+        print("[CAMERA] Probing stream resolution...", flush=True)
+        self.width, self.height = self.probe_resolution()
+        self.frame_size = self.width * self.height * 3
+        print(f"[CAMERA] Stream resolution detected: {self.width}x{self.height} (frame_size={self.frame_size} bytes)", flush=True)
+
         cmd = [
             self.ffmpeg_exe,
             "-loglevel", "error",
-            "-rtsp_transport", "udp",
-            "-buffer_size", "8388608",        # 8MB socket buffer (zero drops)
-            "-probesize", "131072",           # 128KB fast probe
-            "-analyzeduration", "100000",     # 100ms analyze duration (<1s connection)
-            "-max_delay", "50000",            # 50ms max jitter delay (sub-5ms live delivery)
-            "-fflags", "nobuffer+flush_packets+genpts+discardcorrupt",
-            "-flags", "low_delay",
-            "-an",                            # disable audio decode overhead
+            "-buffer_size", "33554432",        # 32MB socket buffer to prevent packet drops
+            "-max_delay", "500000",            # 500ms jitter buffer
+            "-reorder_queue_size", "4000",
+            "-an",
             "-i", self.rtsp_url,
-            "-f", "image2pipe",
-            "-vcodec", "mjpeg",
-            "-q:v", "2",
+            "-map", "0:v:0",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
             "-"
         ]
 
@@ -256,109 +367,86 @@ class RTSPCaptureManager:
             print("[CAMERA] Validating frames", flush=True)
             self.state = CameraState.VALIDATING
 
-            pipe_buffer = bytearray()
             consecutive_good = 0
             validation_attempts = 0
             validated = False
 
-            # Startup Validation Loop: Require 3 consecutive valid frames
-            while not self._stop_event.is_set() and self.proc.poll() is None and validation_attempts < 200:
-                chunk = self.proc.stdout.read(16384)
-                if not chunk:
+            # Startup Validation Loop: Require consecutive clean, non-corrupted frames
+            while not self._stop_event.is_set() and self.proc.poll() is None and validation_attempts < 100:
+                raw_bytes = self._read_exactly(self.frame_size)
+                if raw_bytes is None or len(raw_bytes) != self.frame_size:
                     if self._stop_event.is_set() or self.proc.poll() is not None:
                         break
-                    time.sleep(0.001)
+                    time.sleep(0.01)
                     continue
-                pipe_buffer.extend(chunk)
 
-                while True:
-                    soi = pipe_buffer.find(b"\xff\xd8")
-                    if soi == -1:
-                        if len(pipe_buffer) > 1:
-                            pipe_buffer = pipe_buffer[-1:]
+                validation_attempts += 1
+                seq_id += 1
+                t_cap = time.perf_counter()
+
+                # Reshape EXACT fixed-size raw BGR24 data
+                raw_frame = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((self.height, self.width, 3))
+
+                if is_clean_frame(raw_frame):
+                    consecutive_good += 1
+                    print(f"[CAMERA] Valid frame {consecutive_good}/{CONSECUTIVE_VALID_REQUIRED}", flush=True)
+
+                    if consecutive_good >= CONSECUTIVE_VALID_REQUIRED:
+                        self.slot.publish_frame(raw_frame, seq_id, t_cap)
+                        self.state = CameraState.LIVE
+                        self._live_event.set()
+                        if is_recovering:
+                            print("[CAMERA] Recovered successfully", flush=True)
+                            is_recovering = False
+                        print("[CAMERA] LIVE", flush=True)
+                        validated = True
                         break
-                    eoi = pipe_buffer.find(b"\xff\xd9", soi + 2)
-                    if eoi == -1:
-                        if soi > 0:
-                            pipe_buffer = pipe_buffer[soi:]
-                        break
-
-                    jpg_bytes = pipe_buffer[soi:eoi + 2]
-                    pipe_buffer = pipe_buffer[eoi + 2:]
-                    validation_attempts += 1
-                    seq_id += 1
-                    t_cap = time.perf_counter()
-
-                    raw_frame = cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-                    
-                    if raw_frame is not None and raw_frame.size > 0 and float(raw_frame.std()) > 10.0:
-                        consecutive_good += 1
-                        print(f"[CAMERA] Valid frame {consecutive_good}/{CONSECUTIVE_VALID_REQUIRED}", flush=True)
-
-                        if consecutive_good >= CONSECUTIVE_VALID_REQUIRED:
-                            self.slot.publish_frame(raw_frame, seq_id, t_cap)
-                            self.state = CameraState.LIVE
-                            self._live_event.set()
-                            if is_recovering:
-                                print("[CAMERA] Recovered successfully", flush=True)
-                                is_recovering = False
-                            print("[CAMERA] LIVE", flush=True)
-                            validated = True
-                            break
-                    else:
-                        consecutive_good = 0
-
-                if validated:
-                    break
+                else:
+                    consecutive_good = 0
 
             if not validated:
                 if self._stop_event.is_set():
                     break
                 print("[CAMERA] Startup validation failed. Recovery started", flush=True)
                 self._safe_close_proc()
-                time.sleep(1.0)
+                time.sleep(0.5)
                 continue
 
-            # LIVE Streaming Loop: Fast read -> decode -> publish to atomic slot
+            # LIVE Streaming Loop: Fast read_exactly -> clean validation -> publish to atomic slot
             consecutive_failures = 0
+            consecutive_corrupt = 0
+            
             while not self._stop_event.is_set() and self.proc.poll() is None:
-                chunk = self.proc.stdout.read(16384)
-                if not chunk:
-                    if self._stop_event.is_set() or self.proc.poll() is not None:
+                raw_bytes = self._read_exactly(self.frame_size)
+                if raw_bytes is None or len(raw_bytes) != self.frame_size:
+                    consecutive_failures += 1
+                    self.read_failures += 1
+                    if consecutive_failures >= MAX_READ_FAILURES or self.proc.poll() is not None:
                         break
-                    time.sleep(0.001)
+                    time.sleep(0.005)
                     continue
-                pipe_buffer.extend(chunk)
 
-                while True:
-                    soi = pipe_buffer.find(b"\xff\xd8")
-                    if soi == -1:
-                        if len(pipe_buffer) > 1:
-                            pipe_buffer = pipe_buffer[-1:]
+                seq_id += 1
+                t_cap = time.perf_counter()
+
+                # Reshape exact complete raw frame
+                raw_frame = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((self.height, self.width, 3))
+
+                # Strict Clean Frame Check:
+                # If a dropped network packet caused H.265 grey smear or checkerboard blocks,
+                # discard this frame so it NEVER corrupts the user's display!
+                if not is_clean_frame(raw_frame):
+                    consecutive_corrupt += 1
+                    self.corrupted_frames += 1
+                    if consecutive_corrupt >= MAX_CONSECUTIVE_CORRUPT:
+                        print("[CAMERA] Corrupt frame threshold exceeded (missing I-frame). Triggering fast recovery...", flush=True)
                         break
-                    eoi = pipe_buffer.find(b"\xff\xd9", soi + 2)
-                    if eoi == -1:
-                        if soi > 0:
-                            pipe_buffer = pipe_buffer[soi:]
-                        break
+                    continue
 
-                    jpg_bytes = pipe_buffer[soi:eoi + 2]
-                    pipe_buffer = pipe_buffer[eoi + 2:]
-                    seq_id += 1
-                    t_cap = time.perf_counter()
-
-                    raw_frame = cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-
-                    if raw_frame is None or raw_frame.size == 0:
-                        consecutive_failures += 1
-                        self.read_failures += 1
-                        if consecutive_failures >= MAX_READ_FAILURES:
-                            break
-                        continue
-
-                    # Publish frame atomically (discards old frame if display didn't consume)
-                    consecutive_failures = 0
-                    self.slot.publish_frame(raw_frame, seq_id, t_cap)
+                # Frame is 100% clean and pristine
+                consecutive_corrupt = 0
+                consecutive_failures = 0
+                self.slot.publish_frame(raw_frame, seq_id, t_cap)
 
             # Controlled Single-Flight Recovery
             if not self._stop_event.is_set():
@@ -399,6 +487,7 @@ class RTSPCaptureManager:
             self.slot.clear()
             self.state = CameraState.STOPPED
             print("[CAMERA] Shutdown complete", flush=True)
+
 
 
 def on_mouse_click(event, x, y, flags, param):
